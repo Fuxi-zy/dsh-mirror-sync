@@ -112,7 +112,7 @@ jobs:
           GITHUB_URL="https://github.com/${GITHUB_DIST_REPO}/releases/tag/${TAG}"
           echo "发布 Release: $TAG"
 
-          # ── ① 两端仓库准备:克隆到本地,空仓库则自动初始化(README + master)──
+          # ── ① 两端仓库准备:克隆到本地;空仓库自动初始化;统一工作分支为 master ──
           prepare_dist() { # $1=目录 $2=带凭证远端 URL
             rm -rf "$1"
             if ! git clone -q "$2" "$1" 2>/dev/null || [ -z "$(git -C "$1" ls-remote --heads origin 2>/dev/null | head -1)" ]; then
@@ -125,6 +125,10 @@ jobs:
               git remote add origin "$2"
               git push -q origin master
               cd - >/dev/null
+            else
+              # 远端默认分支可能是 main(GitHub 新仓库),统一在 master 上工作并确保远端存在 master
+              git -C "$1" checkout -q -B master
+              git -C "$1" push -q origin master
             fi
           }
           prepare_dist /tmp/dist-gitee "https://zhang-jixiangZJX:${GITEE_TOKEN}@gitee.com/zhang-jixiangZJX/dsh-dist.git"

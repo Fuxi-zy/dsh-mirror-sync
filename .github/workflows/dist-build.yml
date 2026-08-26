@@ -138,8 +138,15 @@ jobs:
           echo "Gitee Release ID: $RELEASE_ID"
           find repo/dist/npm repo/dist/npm-vendor -name '*.tgz' -print0 | while IFS= read -r -d '' f; do
             echo "Gitee 附件: $f ($(du -h "$f" | cut -f1))"
-            curl -fsS -X POST "https://gitee.com/api/v5/repos/zhang-jixiangZJX/dsh-dist/releases/${RELEASE_ID}/attach_files" \
-              -F "access_token=${GITEE_TOKEN}" -F "files=@${f}" >/dev/null
+            # 注意:Gitee 的附件字段名是 file(单数),不是 GitHub 惯例的 files
+            HTTP=$(curl -sS -o /tmp/attach-resp.txt -w '%{http_code}' -X POST \
+              "https://gitee.com/api/v5/repos/zhang-jixiangZJX/dsh-dist/releases/${RELEASE_ID}/attach_files" \
+              -F "access_token=${GITEE_TOKEN}" -F "file=@${f}")
+            if [ "$HTTP" != "200" ] && [ "$HTTP" != "201" ]; then
+              echo "上传失败 HTTP $HTTP: $f"
+              cat /tmp/attach-resp.txt
+              exit 1
+            fi
           done
 
           # ── ③ GitHub dsh-dist:建 Release + 传附件(用 PAT 跨仓库写入)──

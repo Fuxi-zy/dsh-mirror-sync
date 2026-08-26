@@ -1,10 +1,12 @@
 name: Dist Build
 
-# deepseek-harness master 预构建流水线
+# deepseek-harness master 预构建流水线(双 job:构建 → 发布)
 # 运行在本控制仓(dsh-mirror-sync):clone 上游 → 构建 + 打包 npm tarballs
-# → 上游无更新时自动跳过 → 产物发布到两个专职制品仓库(空仓库会自动初始化):
+# → 上游无更新时自动跳过 → 产物经 artifact 桥接到 publish job 发布到两端制品仓:
 #   · gitee dsh-dist(国内主源)          secret: GITEE_TOKEN
 #   · github dsh-dist(海外主源)          secret: GH_PAT(跨仓库写入需要 PAT)
+#
+# 发布阶段失败时,在 Actions 运行页点 "Re-run failed jobs" 只重跑发布(约 1 分钟),无需重新构建
 
 on:
   workflow_run:
@@ -20,6 +22,7 @@ env:
   NODE_VERSION: '24'
   DSH_TELEMETRY_DISABLED: '1'
   GITHUB_DIST_REPO: 'Fuxi-zy/dsh-dist'
+  ARTIFACT_NAME: dsh-npm-tarballs
 
 jobs:
   build:
@@ -27,41 +30,47 @@ jobs:
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 90
+    outputs:
+      skip: ${{ steps.meta.outputs.skip }}
+      upstream_sha: ${{ steps.meta.outputs.sha }}
     steps:
       - name: 克隆上游并去重
+        id: meta
         run: |
           set -euo pipefail
           git clone https://github.com/deepseek-ai/deepseek-harness.git "$GITHUB_WORKSPACE/repo"
           cd "$GITHUB_WORKSPACE/repo"
           UPSTREAM_SHA=$(git rev-parse HEAD)
-          echo "UPSTREAM_SHA=$UPSTREAM_SHA" >> "$GITHUB_ENV"
+          echo "sha=$UPSTREAM_SHA" >> "$GITHUB_OUTPUT"
           echo "上游 master: $UPSTREAM_SHA"
           LAST=$(curl -fsSL -m 30 "https://api.github.com/repos/${GITHUB_DIST_REPO}/contents/latest.json" 2>/dev/null \
             | node -e "let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{try{console.log(JSON.parse(Buffer.from(JSON.parse(d).content,'base64').toString('utf8')).upstream_sha||'')}catch(e){console.log('')}})" || true)
           echo "上次构建: ${LAST:-无}"
           if [ -n "$LAST" ] && [ "$UPSTREAM_SHA" = "$LAST" ]; then
-            echo "SKIP_BUILD=1" >> "$GITHUB_ENV"
+            echo "skip=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=0" >> "$GITHUB_OUTPUT"
           fi
 
       - name: 上游无更新,跳过构建
-        if: env.SKIP_BUILD == '1'
+        if: steps.meta.outputs.skip == '1'
         run: echo "自上次构建以来上游无新提交,本次跳过。"
 
       - name: 安装 pnpm
-        if: env.SKIP_BUILD != '1'
+        if: steps.meta.outputs.skip != '1'
         uses: pnpm/action-setup@v4
         with:
-          version: 11.7.0 # 与上游 package.json 的 packageManager 一致(dsh-mirror-sync 自身无 package.json,须显式指定)
+          version: 11.7.0 # 与上游 package.json 的 packageManager 一致(本仓库无 package.json,须显式指定)
           dest: ${{ runner.temp }}/setup-pnpm
 
       - name: 安装 Node
-        if: env.SKIP_BUILD != '1'
+        if: steps.meta.outputs.skip != '1'
         uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_VERSION }}
 
       - name: pnpm store 缓存
-        if: env.SKIP_BUILD != '1'
+        if: steps.meta.outputs.skip != '1'
         uses: actions/cache@v4
         with:
           path: ~/.local/share/pnpm/store
@@ -69,48 +78,84 @@ jobs:
           restore-keys: dist-node24-pnpm-
 
       - name: 安装依赖
-        if: env.SKIP_BUILD != '1'
+        if: steps.meta.outputs.skip != '1'
         working-directory: repo
         run: pnpm install --frozen-lockfile
 
       - name: 构建(official 配置,流程照抄上游 Release (dsh) workflow)
-        if: env.SKIP_BUILD != '1'
+        if: steps.meta.outputs.skip != '1'
         working-directory: repo
         run: pnpm run build:official
 
       - name: 打包 dsh 家族 tarballs
-        if: env.SKIP_BUILD != '1'
+        if: steps.meta.outputs.skip != '1'
         working-directory: repo
         run: pnpm run release:pack --family dsh --out dist/npm
 
       - name: 打包 vendor 家族 tarballs(peer 依赖,运行需要)
-        if: env.SKIP_BUILD != '1'
+        if: steps.meta.outputs.skip != '1'
         working-directory: repo
         run: pnpm run release:pack --family vendor --out dist/npm-vendor
 
       - name: 验证 tarball 可安装运行(上游官方验证步骤)
-        if: env.SKIP_BUILD != '1'
+        if: steps.meta.outputs.skip != '1'
         working-directory: repo
         run: |
           pnpm --dir native/landlock-run run build:ts
           pnpm --dir native/landlock-run/packages/entry pack --pack-destination "$PWD/dist/npm-landlock"
           pnpm run release:verify-packed-install --family dsh --from dist/npm --from dist/npm-vendor --from dist/npm-landlock
 
+      - name: 上传构建产物(供 publish job 使用)
+        if: steps.meta.outputs.skip != '1'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: repo/dist/npm*/
+          retention-days: 7
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    if: needs.build.outputs.skip != '1'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+      GH_PAT: ${{ secrets.GH_PAT }}
+      UPSTREAM_SHA: ${{ needs.build.outputs.upstream_sha }}
+    steps:
+      - name: 下载构建产物
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: dist
+
       - name: 发布到两端 dsh-dist
-        if: env.SKIP_BUILD != '1'
-        env:
-          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
-          GH_PAT: ${{ secrets.GH_PAT }}
         run: |
           set -euo pipefail
-          UPSTREAM_SHA="${{ env.UPSTREAM_SHA }}"
           SHORT=${UPSTREAM_SHA:0:9}
           DATE=$(date -u +%Y%m%d-%H%M)
           TAG="master-${SHORT}-${DATE}"
           BUILT_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           GITEE_URL="https://gitee.com/zhang-jixiangZJX/dsh-dist/releases/${TAG}"
           GITHUB_URL="https://github.com/${GITHUB_DIST_REPO}/releases/tag/${TAG}"
+          export GH_TOKEN="${GH_PAT}"
           echo "发布 Release: $TAG"
+
+          # ── ⓪ 清理同上游 SHA 的历史残留(此前失败遗留的半成品 Release 与 tag)──
+          curl -fsSL -m 60 "https://gitee.com/api/v5/repos/zhang-jixiangZJX/dsh-dist/releases?access_token=${GITEE_TOKEN}&per_page=100" 2>/dev/null \
+            | node -e "let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{try{for(const r of JSON.parse(d))if(r.tag_name&&r.tag_name.startsWith('master-${SHORT}-'))console.log(r.id+' '+r.tag_name)}catch(e){}})" \
+          | while read -r rid rtag; do
+              echo "清理 Gitee 残留: $rtag (ID $rid)"
+              curl -fsS -m 60 -X DELETE "https://gitee.com/api/v5/repos/zhang-jixiangZJX/dsh-dist/releases/${rid}?access_token=${GITEE_TOKEN}" || true
+              curl -fsS -m 60 -X DELETE "https://gitee.com/api/v5/repos/zhang-jixiangZJX/dsh-dist/tags/${rtag}?access_token=${GITEE_TOKEN}" || true
+            done
+          gh release list -R "${GITHUB_DIST_REPO}" --json tagName \
+            --jq ".[] | select(.tagName|startswith(\"master-${SHORT}-\")) | .tagName" 2>/dev/null \
+          | while read -r rtag; do
+              echo "清理 GitHub 残留: $rtag"
+              gh release delete "$rtag" -R "${GITHUB_DIST_REPO}" --yes --cleanup-tag || true
+            done
 
           # ── ① 两端仓库准备:克隆到本地;空仓库自动初始化;统一工作分支为 master ──
           prepare_dist() { # $1=目录 $2=带凭证远端 URL
@@ -134,28 +179,36 @@ jobs:
           prepare_dist /tmp/dist-gitee "https://zhang-jixiangZJX:${GITEE_TOKEN}@gitee.com/zhang-jixiangZJX/dsh-dist.git"
           prepare_dist /tmp/dist-gh "https://x-access-token:${GH_PAT}@github.com/${GITHUB_DIST_REPO}.git"
 
-          # ── ② Gitee dsh-dist:建 Release + 传附件 ─────────────
-          RELEASE_JSON=$(curl -fsS -X POST "https://gitee.com/api/v5/repos/zhang-jixiangZJX/dsh-dist/releases" \
+          # ── ② Gitee dsh-dist:建 Release + 传附件(带重试,跨境链路防抖动)──
+          RELEASE_JSON=$(curl -fsS --retry 3 --retry-all-errors --connect-timeout 20 --max-time 120 \
+            -X POST "https://gitee.com/api/v5/repos/zhang-jixiangZJX/dsh-dist/releases" \
             -H "Content-Type: application/json;charset=UTF-8" \
             -d "{\"access_token\":\"${GITEE_TOKEN}\",\"tag_name\":\"${TAG}\",\"name\":\"${TAG}\",\"body\":\"deepseek-harness master 预构建 | 上游提交 ${UPSTREAM_SHA} | ${DATE} UTC\",\"target_commitish\":\"master\"}")
           RELEASE_ID=$(echo "$RELEASE_JSON" | node -e "let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>console.log(JSON.parse(d).id))")
           echo "Gitee Release ID: $RELEASE_ID"
-          find repo/dist/npm repo/dist/npm-vendor -name '*.tgz' -print0 | while IFS= read -r -d '' f; do
+
+          gitee_upload() { # $1=tgz 路径;最多 4 次,指数退避
+            local f="$1" attempt http
+            for attempt in 1 2 3 4; do
+              http=$(curl -sS -o /tmp/attach-resp.txt -w '%{http_code}' \
+                --connect-timeout 20 --max-time 600 \
+                -X POST "https://gitee.com/api/v5/repos/zhang-jixiangZJX/dsh-dist/releases/${RELEASE_ID}/attach_files" \
+                -F "access_token=${GITEE_TOKEN}" -F "file=@${f}") || http="000"
+              case "$http" in 200|201) return 0 ;; esac
+              echo "  第 ${attempt}/4 次上传失败(HTTP ${http})$( [ "$attempt" -lt 4 ] && echo ",重试中..." )"
+              head -c 200 /tmp/attach-resp.txt 2>/dev/null && echo || true
+              [ "$attempt" -lt 4 ] && sleep $((attempt * 10))
+            done
+            echo "附件最终上传失败: $f"
+            return 1
+          }
+          find dist/npm dist/npm-vendor -name '*.tgz' -print0 | while IFS= read -r -d '' f; do
             echo "Gitee 附件: $f ($(du -h "$f" | cut -f1))"
-            # 注意:Gitee 的附件字段名是 file(单数),不是 GitHub 惯例的 files
-            HTTP=$(curl -sS -o /tmp/attach-resp.txt -w '%{http_code}' -X POST \
-              "https://gitee.com/api/v5/repos/zhang-jixiangZJX/dsh-dist/releases/${RELEASE_ID}/attach_files" \
-              -F "access_token=${GITEE_TOKEN}" -F "file=@${f}")
-            if [ "$HTTP" != "200" ] && [ "$HTTP" != "201" ]; then
-              echo "上传失败 HTTP $HTTP: $f"
-              cat /tmp/attach-resp.txt
-              exit 1
-            fi
+            gitee_upload "$f"
           done
 
           # ── ③ GitHub dsh-dist:建 Release + 传附件(用 PAT 跨仓库写入)──
-          export GH_TOKEN="${GH_PAT}"
-          gh release create "$TAG" repo/dist/npm/*.tgz repo/dist/npm-vendor/*.tgz \
+          gh release create "$TAG" dist/npm/*.tgz dist/npm-vendor/*.tgz \
             -R "${GITHUB_DIST_REPO}" \
             --title "$TAG" \
             --notes "deepseek-harness master 预构建 | 上游提交 ${UPSTREAM_SHA} | ${BUILT_AT} | Gitee 镜像: ${GITEE_URL}" \

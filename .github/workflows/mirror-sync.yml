@@ -1,0 +1,30 @@
+name: Mirror Sync
+
+# 上游 deepseek-harness → Gitee 纯镜像
+# 运行在本控制仓(dsh-mirror-sync),不依赖任何 GitHub 源码仓库
+# 触发:每 6 小时定时 + 手动
+
+on:
+  schedule:
+    - cron: '23 */6 * * *' # UTC,每 6 小时(避开整点高峰)
+  workflow_dispatch:
+
+concurrency:
+  group: mirror-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: 同步上游到 Gitee(分支 + tags 全量镜像)
+        env:
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+        run: |
+          set -euo pipefail
+          git clone --bare https://github.com/deepseek-ai/deepseek-harness.git /tmp/repo.git
+          cd /tmp/repo.git
+          # --mirror:所有分支与 tags 以上游为准,多余 refs 会被清理,Gitee 保持纯镜像
+          git push --force --mirror "https://zhang-jixiangZJX:${GITEE_TOKEN}@gitee.com/zhang-jixiangZJX/deepseek-harness.git"
+          echo "完成: $(git rev-parse HEAD)"

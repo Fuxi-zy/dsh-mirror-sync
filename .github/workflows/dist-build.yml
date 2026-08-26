@@ -51,6 +51,7 @@ jobs:
         if: env.SKIP_BUILD != '1'
         uses: pnpm/action-setup@v4
         with:
+          version: 11.7.0 # 与上游 package.json 的 packageManager 一致(dsh-mirror-sync 自身无 package.json,须显式指定)
           dest: ${{ runner.temp }}/setup-pnpm
 
       - name: 安装 Node

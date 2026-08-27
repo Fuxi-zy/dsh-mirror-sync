@@ -2,11 +2,12 @@ name: Dist Build
 
 # deepseek-harness master 预构建流水线(双 job:构建 → 发布)
 # 运行在本控制仓(dsh-mirror-sync):clone 上游 → 构建 + 打包 npm tarballs
-# → 上游无更新时自动跳过 → 产物经 artifact 桥接到 publish job 发布到两端制品仓:
-#   · gitee dsh-dist(国内主源)          secret: GITEE_TOKEN
-#   · github dsh-dist(海外主源)          secret: GH_PAT(跨仓库写入需要 PAT)
+# → 上游无更新时自动跳过 → 产物经 artifact 桥接到 publish job 发布:
+#   · 制品以普通文件形式提交到两端 dsh-dist 仓库的 pkgs/ 目录(主分发渠道,
+#     消费端 git clone --depth 1 即得全套,不受 Gitee 单 Release 附件 200 上限影响)
+#   · 同时建 Release 作版本标记(GitHub 端附全部 tgz 直链;Gitee 端仅标记页)
 #
-# 发布阶段失败时,在 Actions 运行页点 "Re-run failed jobs" 只重跑发布(约 1 分钟),无需重新构建
+# 发布阶段失败时,在 Actions 运行页点 "Re-run failed jobs" 只重跑发布(约 1 分钟)
 
 on:
   workflow_run:
@@ -157,7 +158,7 @@ jobs:
               gh release delete "$rtag" -R "${GITHUB_DIST_REPO}" --yes --cleanup-tag || true
             done
 
-          # ── ① 两端仓库准备:克隆到本地;空仓库自动初始化;统一工作分支为 master ──
+          # ── ① 两端仓库准备:克隆;空仓库自动初始化;统一工作分支为 master ──
           prepare_dist() { # $1=目录 $2=带凭证远端 URL
             rm -rf "$1"
             if ! git clone -q "$2" "$1" 2>/dev/null || [ -z "$(git -C "$1" ls-remote --heads origin 2>/dev/null | head -1)" ]; then
@@ -171,7 +172,6 @@ jobs:
               git push -q origin master
               cd - >/dev/null
             else
-              # 远端默认分支可能是 main(GitHub 新仓库),统一在 master 上工作并确保远端存在 master
               git -C "$1" checkout -q -B master
               git -C "$1" push -q origin master
             fi
@@ -179,42 +179,42 @@ jobs:
           prepare_dist /tmp/dist-gitee "https://zhang-jixiangZJX:${GITEE_TOKEN}@gitee.com/zhang-jixiangZJX/dsh-dist.git"
           prepare_dist /tmp/dist-gh "https://x-access-token:${GH_PAT}@github.com/${GITHUB_DIST_REPO}.git"
 
-          # ── ② Gitee dsh-dist:建 Release + 传附件(带重试,跨境链路防抖动)──
-          RELEASE_JSON=$(curl -fsS --retry 3 --retry-all-errors --connect-timeout 20 --max-time 120 \
+          # ── ② 制品入库:全部 tgz 提交到两端仓库 pkgs/(主分发渠道,克隆即得全套)──
+          load_pkgs() { # $1=仓库目录
+            rm -rf "$1/pkgs"
+            mkdir -p "$1/pkgs"
+            cp dist/npm/*.tgz "$1/pkgs/"
+            cp dist/npm-vendor/*.tgz "$1/pkgs/"
+            [ -d dist/npm-landlock ] && cp dist/npm-landlock/*.tgz "$1/pkgs/" || true
+            echo "pkgs/ 共 $(ls "$1"/pkgs | wc -l) 个包,计 $(du -sh "$1/pkgs" | cut -f1)"
+            cd "$1"
+            git config user.name "dist-bot"
+            git config user.email "dist-bot@users.noreply.github.com"
+            git add -A pkgs
+            git commit -qm "chore: pkgs -> ${SHORT} (${TAG})"
+            git push -q origin master
+            cd - >/dev/null
+          }
+          load_pkgs /tmp/dist-gitee
+          load_pkgs /tmp/dist-gh
+
+          # ── ③ Gitee Release:仅作版本标记页(附件受单 Release 200 上限,不再承载货物)──
+          curl -fsS --retry 3 --retry-all-errors --connect-timeout 20 --max-time 120 \
             -X POST "https://gitee.com/api/v5/repos/zhang-jixiangZJX/dsh-dist/releases" \
             -H "Content-Type: application/json;charset=UTF-8" \
-            -d "{\"access_token\":\"${GITEE_TOKEN}\",\"tag_name\":\"${TAG}\",\"name\":\"${TAG}\",\"body\":\"deepseek-harness master 预构建 | 上游提交 ${UPSTREAM_SHA} | ${DATE} UTC\",\"target_commitish\":\"master\"}")
-          RELEASE_ID=$(echo "$RELEASE_JSON" | node -e "let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>console.log(JSON.parse(d).id))")
-          echo "Gitee Release ID: $RELEASE_ID"
+            -d "{\"access_token\":\"${GITEE_TOKEN}\",\"tag_name\":\"${TAG}\",\"name\":\"${TAG}\",\"body\":\"deepseek-harness master 预构建 | 上游提交 ${UPSTREAM_SHA} | ${DATE} UTC | 制品请直接克隆本仓库 master 分支的 pkgs/ 目录\",\"target_commitish\":\"master\"}" >/dev/null
+          echo "Gitee 标记 Release 已创建"
 
-          gitee_upload() { # $1=tgz 路径;最多 4 次,指数退避
-            local f="$1" attempt http
-            for attempt in 1 2 3 4; do
-              http=$(curl -sS -o /tmp/attach-resp.txt -w '%{http_code}' \
-                --connect-timeout 20 --max-time 600 \
-                -X POST "https://gitee.com/api/v5/repos/zhang-jixiangZJX/dsh-dist/releases/${RELEASE_ID}/attach_files" \
-                -F "access_token=${GITEE_TOKEN}" -F "file=@${f}") || http="000"
-              case "$http" in 200|201) return 0 ;; esac
-              echo "  第 ${attempt}/4 次上传失败(HTTP ${http})$( [ "$attempt" -lt 4 ] && echo ",重试中..." )"
-              head -c 200 /tmp/attach-resp.txt 2>/dev/null && echo || true
-              [ "$attempt" -lt 4 ] && sleep $((attempt * 10))
-            done
-            echo "附件最终上传失败: $f"
-            return 1
-          }
-          find dist/npm dist/npm-vendor -name '*.tgz' -print0 | while IFS= read -r -d '' f; do
-            echo "Gitee 附件: $f ($(du -h "$f" | cut -f1))"
-            gitee_upload "$f"
-          done
-
-          # ── ③ GitHub dsh-dist:建 Release + 传附件(用 PAT 跨仓库写入)──
-          gh release create "$TAG" dist/npm/*.tgz dist/npm-vendor/*.tgz \
+          # ── ④ GitHub Release:附带全部 tgz 直链(无上限,便于单个取用)──
+          FILES=(dist/npm/*.tgz dist/npm-vendor/*.tgz)
+          [ -d dist/npm-landlock ] && FILES+=(dist/npm-landlock/*.tgz)
+          gh release create "$TAG" "${FILES[@]}" \
             -R "${GITHUB_DIST_REPO}" \
             --title "$TAG" \
-            --notes "deepseek-harness master 预构建 | 上游提交 ${UPSTREAM_SHA} | ${BUILT_AT} | Gitee 镜像: ${GITEE_URL}" \
+            --notes "deepseek-harness master 预构建 | 上游提交 ${UPSTREAM_SHA} | ${BUILT_AT} | 整套获取建议直接克隆仓库 pkgs/ 目录 | Gitee 镜像: ${GITEE_URL}" \
             --target master
 
-          # ── ④ 双端更新 latest.json(发布全部成功后才移动指针)────
+          # ── ⑤ 双端更新 latest.json(发布全部成功后才移动指针)────
           write_latest() { # $1=目录
             cd "$1"
             cat > latest.json <<EOF

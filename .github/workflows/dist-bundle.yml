@@ -18,7 +18,9 @@ concurrency:
 env:
   GITHUB_DIST_REPO: 'Fuxi-zy/dsh-dist'
   DSH_PKG: '@deepseek-ai/dsh'
-  NPM_MIRROR: 'https://registry.npmmirror.com'
+  # runner 在海外,官方源最快(实测 npmmirror 从美西访问极慢,一次 view 要 11s);
+  # bundle 内容与源无关(包内容寻址一致),npmmirror 只用于国内应用端
+  NPM_REGISTRY: 'https://registry.npmjs.org'
 
 jobs:
   bundle:
@@ -30,7 +32,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          LATEST=$(npm view $DSH_PKG version --registry=$NPM_MIRROR)
+          LATEST=$(npm view $DSH_PKG version --registry=$NPM_REGISTRY)
           echo "version=$LATEST" >> "$GITHUB_OUTPUT"
           echo "npm 最新版: $LATEST"
           LAST=$(curl -fsSL -m 30 "https://api.github.com/repos/${GITHUB_DIST_REPO}/contents/latest.json" 2>/dev/null \
@@ -56,32 +58,19 @@ jobs:
           # package.json 必须先存在:目录无 package.json 时 npm 不建 .bin shim(实测坑)
           printf '{"name":"dsh-runtime","private":true}' > runtime/package.json
           cd runtime
-          npm install $DSH_PKG --registry=$NPM_MIRROR --foreground-scripts --no-audit --no-fund
+          # 心跳:npm 非交互几乎零输出,防"像卡死"
+          ( while sleep 60; do echo "[npm] 仍在安装中…(下载/原生模块编译静默期)"; done ) &
+          HEARTBEAT=$!
+          trap 'kill $HEARTBEAT 2>/dev/null || true' EXIT
+          npm install $DSH_PKG --registry=$NPM_REGISTRY --foreground-scripts --no-audit --no-fund
+          kill $HEARTBEAT 2>/dev/null || true
           # 完整性校验:bin shim 与包本体必须就位
           test -f node_modules/.bin/dsh.cmd
           INSTALLED=$(node -p "require('./node_modules/@deepseek-ai/dsh/package.json').version")
           echo "已安装: $INSTALLED"
           test "$INSTALLED" = "${{ steps.meta.outputs.version }}"
 
-      - name: 精简 node_modules(运行不需要的都删,压体积)
-        if: steps.meta.outputs.skip != '1'
-        shell: pwsh
-        run: |
-          $before = (Get-ChildItem -Recurse runtime -File | Measure-Object Length -Sum).Sum
-          # 源码映射/文档/类型声明源文件:运行零依赖,体积大头(*.map 常占 30%+)
-          foreach ($ext in @('*.map', '*.md', '*.markdown', '*.ts')) {
-            Get-ChildItem -Recurse runtime -Filter $ext -File -ErrorAction SilentlyContinue | Remove-Item -Force
-          }
-          # 测试/示例/文档目录
-          foreach ($d in @('test', 'tests', '__tests__', 'example', 'examples', 'docs', '.github')) {
-            Get-ChildItem -Recurse runtime -Directory -Filter $d -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force
-          }
-          $after = (Get-ChildItem -Recurse runtime -File | Measure-Object Length -Sum).Sum
-          Write-Host "精简: $([math]::Round($before/1MB,1)) MB -> $([math]::Round($after/1MB,1)) MB"
-          # 精简后完整性复查:bin 与包本体仍须在
-          if (-not (Test-Path runtime/node_modules/.bin/dsh.cmd)) { throw "精简误删:dsh.cmd 不见了" }
-
-      - name: 冒烟(bin 可执行;置于精简后,误删当场暴露)
+      - name: 冒烟(bin 可执行)
         if: steps.meta.outputs.skip != '1'
         shell: cmd
         run: |

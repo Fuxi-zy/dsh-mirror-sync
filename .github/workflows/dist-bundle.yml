@@ -49,20 +49,22 @@ jobs:
         shell: bash
         run: echo "npm 上无新版本,本次跳过。"
 
-      - name: 安装(Node 自带 npm;含原生模块的本机编译)
+      - name: 安装(pnpm hoisted,Windows 上比 npm 快数倍)
         if: steps.meta.outputs.skip != '1'
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p runtime
-          # package.json 必须先存在:目录无 package.json 时 npm 不建 .bin shim(实测坑)
           printf '{"name":"dsh-runtime","private":true}' > runtime/package.json
+          # node-linker=hoisted:装出与 npm 完全同构的平铺 node_modules(zip/运行兼容)
+          printf 'node-linker=hoisted\n' > runtime/.npmrc
+          command -v pnpm >/dev/null 2>&1 || npm i -g pnpm
           cd runtime
-          # 心跳:npm 非交互几乎零输出,防"像卡死"
-          ( while sleep 60; do echo "[npm] 仍在安装中…(下载/原生模块编译静默期)"; done ) &
+          # 心跳:安装静默期防"像卡死"
+          ( while sleep 60; do echo "[pnpm] 仍在安装中…(下载/原生模块编译静默期)"; done ) &
           HEARTBEAT=$!
           trap 'kill $HEARTBEAT 2>/dev/null || true' EXIT
-          npm install $DSH_PKG --registry=$NPM_REGISTRY --foreground-scripts --no-audit --no-fund
+          pnpm add $DSH_PKG --registry=$NPM_REGISTRY
           kill $HEARTBEAT 2>/dev/null || true
           # 完整性校验:bin shim 与包本体必须就位
           test -f node_modules/.bin/dsh.cmd

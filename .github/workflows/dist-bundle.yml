@@ -102,20 +102,22 @@ jobs:
       - name: 打包 tar.xz + sha256
         if: steps.meta.outputs.skip != '1'
         id: pack
-        shell: pwsh
+        shell: bash
         run: |
-          $v = "${{ steps.meta.outputs.version }}"
-          $archive = "dsh-win-x64-$v.tar.xz"
+          set -euo pipefail
+          v="${{ steps.meta.outputs.version }}"
+          archive="dsh-win-x64-${v}.tar.xz"
           # tar.xz(LZMA2):比 zip 小一半以上(实测 78MB→11MB),跨境上传快数倍;
-          # 应用端解压用系统自带 tar.exe(Windows 10+ 原生支持 xz),零额外依赖。
-          # -C runtime .:包内容直接平铺在归档顶层(package.json、node_modules)
-          tar -cJf $archive -C runtime .
-          $size = (Get-Item $archive).Length
-          Write-Host "tar.xz: $archive ($([math]::Round($size/1MB,1)) MB)"
-          $sha = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLower()
-          "archive=$archive" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-          "size=$size" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-          "sha256=$sha" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          # 用 git-bash 的 GNU tar+xz:runner 系统 tar.exe(libarchive)未编译 xz 支持;
+          # 应用端解压仍用系统 tar.exe(Windows 10/11 原生支持 xz,零依赖)。
+          # -C runtime .:包内容平铺在归档顶层(package.json、node_modules)
+          tar -cJf "$archive" -C runtime .
+          size=$(stat -c%s "$archive")
+          sha=$(sha256sum "$archive" | awk '{print $1}')
+          echo "tar.xz: $archive ($((size / 1024 / 1024)) MB)"
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+          echo "size=$size" >> "$GITHUB_OUTPUT"
+          echo "sha256=$sha" >> "$GITHUB_OUTPUT"
 
       - name: 发布到两端 dsh-dist
         if: steps.meta.outputs.skip != '1'

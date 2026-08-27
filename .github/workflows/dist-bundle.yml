@@ -56,8 +56,28 @@ jobs:
           set -euo pipefail
           mkdir -p runtime
           printf '{"name":"dsh-runtime","private":true}' > runtime/package.json
-          # node-linker=hoisted:装出与 npm 完全同构的平铺 node_modules(zip/运行兼容)
-          printf 'node-linker=hoisted\n' > runtime/.npmrc
+          # pnpm 11:设置与构建放行都走 pnpm-workspace.yaml(.npmrc 的 node-linker 已不生效)
+          # - nodeLinker: hoisted → 平铺 node_modules,与 npm 同构(zip/运行兼容)
+          # - allowBuilds → 放行原生模块构建脚本(pnpm 11 默认拦截,ERR_PNPM_IGNORED_BUILDS;
+          #   清单与项目 fxe-marketplace/src/host/install.ts 的白名单保持一致)
+          cat > runtime/pnpm-workspace.yaml <<'YAML'
+          packages:
+            - '.'
+          nodeLinker: hoisted
+          allowBuilds:
+            '@deepseek-ai/dsh-subprocess-local': true
+            '@google/genai': true
+            'koffi': true
+            'node-pty': true
+            'cpu-features': true
+            'ssh2': true
+            'protobufjs': true
+            'esbuild': true
+            'unrs-resolver': true
+            'sharp': true
+            '@tailwindcss/oxide': true
+            '@parcel/watcher': true
+          YAML
           command -v pnpm >/dev/null 2>&1 || npm i -g pnpm
           cd runtime
           # 心跳:安装静默期防"像卡死"

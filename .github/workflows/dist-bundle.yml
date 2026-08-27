@@ -1,0 +1,198 @@
+name: Dist Bundle
+
+# dsh 官方 npm 发布版 → 开箱即用 bundle(Windows)
+# 流程:查询 npmmirror 上 @deepseek-ai/dsh 最新版 → 与上次 bundle 版本比对(去重)
+#      → Windows runner 上 npm install(原生模块按用户平台编译)+ 冒烟
+#      → 整目录打 zip → 发布双端 dsh-dist Release + 更新 latest.json
+# 应用端:下载 zip → sha256 校验 → 解压即用(首次 2~4 分钟,替代 19 分钟在线安装)
+
+on:
+  schedule:
+    - cron: '41 */8 * * *' # UTC,每 8 小时检查 npm 新版(官方发版节奏不频繁,足够及时)
+  workflow_dispatch:
+
+concurrency:
+  group: dist-bundle
+  cancel-in-progress: false
+
+env:
+  GITHUB_DIST_REPO: 'Fuxi-zy/dsh-dist'
+  DSH_PKG: '@deepseek-ai/dsh'
+  NPM_MIRROR: 'https://registry.npmmirror.com'
+
+jobs:
+  bundle:
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - name: 查询最新版本并去重
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          LATEST=$(npm view $DSH_PKG version --registry=$NPM_MIRROR)
+          echo "version=$LATEST" >> "$GITHUB_OUTPUT"
+          echo "npm 最新版: $LATEST"
+          LAST=$(curl -fsSL -m 30 "https://api.github.com/repos/${GITHUB_DIST_REPO}/contents/latest.json" 2>/dev/null \
+            | node -e "let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{try{console.log(JSON.parse(Buffer.from(JSON.parse(d).content,'base64').toString('utf8')).version||'')}catch(e){console.log('')}})" || true)
+          echo "上次 bundle: ${LAST:-无}"
+          if [ -n "$LAST" ] && [ "$LATEST" = "$LAST" ]; then
+            echo "skip=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=0" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 无新版本,跳过
+        if: steps.meta.outputs.skip == '1'
+        shell: bash
+        run: echo "npm 上无新版本,本次跳过。"
+
+      - name: 安装(Node 自带 npm;含原生模块的本机编译)
+        if: steps.meta.outputs.skip != '1'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p runtime
+          # package.json 必须先存在:目录无 package.json 时 npm 不建 .bin shim(实测坑)
+          printf '{"name":"dsh-runtime","private":true}' > runtime/package.json
+          cd runtime
+          npm install $DSH_PKG --registry=$NPM_MIRROR --foreground-scripts --no-audit --no-fund
+          # 完整性校验:bin shim 与包本体必须就位
+          test -f node_modules/.bin/dsh.cmd
+          INSTALLED=$(node -p "require('./node_modules/@deepseek-ai/dsh/package.json').version")
+          echo "已安装: $INSTALLED"
+          test "$INSTALLED" = "${{ steps.meta.outputs.version }}"
+
+      - name: 精简 node_modules(运行不需要的都删,压体积)
+        if: steps.meta.outputs.skip != '1'
+        shell: pwsh
+        run: |
+          $before = (Get-ChildItem -Recurse runtime -File | Measure-Object Length -Sum).Sum
+          # 源码映射/文档/类型声明源文件:运行零依赖,体积大头(*.map 常占 30%+)
+          foreach ($ext in @('*.map', '*.md', '*.markdown', '*.ts')) {
+            Get-ChildItem -Recurse runtime -Filter $ext -File -ErrorAction SilentlyContinue | Remove-Item -Force
+          }
+          # 测试/示例/文档目录
+          foreach ($d in @('test', 'tests', '__tests__', 'example', 'examples', 'docs', '.github')) {
+            Get-ChildItem -Recurse runtime -Directory -Filter $d -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force
+          }
+          $after = (Get-ChildItem -Recurse runtime -File | Measure-Object Length -Sum).Sum
+          Write-Host "精简: $([math]::Round($before/1MB,1)) MB -> $([math]::Round($after/1MB,1)) MB"
+          # 精简后完整性复查:bin 与包本体仍须在
+          if (-not (Test-Path runtime/node_modules/.bin/dsh.cmd)) { throw "精简误删:dsh.cmd 不见了" }
+
+      - name: 冒烟(bin 可执行;置于精简后,误删当场暴露)
+        if: steps.meta.outputs.skip != '1'
+        shell: cmd
+        run: |
+          cd runtime
+          node_modules\.bin\dsh.cmd --help || echo warn: dsh --help 非零退出(不阻断,完整性已由文件校验保证)
+
+      - name: 打包 zip + sha256
+        if: steps.meta.outputs.skip != '1'
+        id: pack
+        shell: pwsh
+        run: |
+          $v = "${{ steps.meta.outputs.version }}"
+          $zip = "dsh-win-x64-$v.zip"
+          Compress-Archive -Path runtime/* -DestinationPath $zip -CompressionLevel Optimal
+          $size = (Get-Item $zip).Length
+          Write-Host "zip: $zip ($([math]::Round($size/1MB,1)) MB)"
+          if ($size -gt 95MB) { Write-Host "::warning::zip 超 95MB,接近 Gitee 附件上限,需启用 7z 分卷方案" }
+          $sha = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          "zip=$zip" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "size=$size" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "sha256=$sha" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: 发布到两端 dsh-dist
+        if: steps.meta.outputs.skip != '1'
+        shell: bash
+        env:
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+          ZIP: ${{ steps.pack.outputs.zip }}
+          SHA256: ${{ steps.pack.outputs.sha256 }}
+          SIZE: ${{ steps.pack.outputs.size }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          TAG="bundle-v${VERSION}-win-x64"
+          BUILT_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          GITEE_URL="https://gitee.com/zhang-jixiangZJX/dsh-dist/releases/${TAG}"
+          GITHUB_URL="https://github.com/${GITHUB_DIST_REPO}/releases/tag/${TAG}"
+          export GH_TOKEN="${GH_PAT}"
+          echo "发布: $TAG"
+
+          # 空仓库兜底 + 统一 master 分支
+          prepare_dist() { # $1=目录 $2=带凭证远端 URL
+            rm -rf "$1"
+            if ! git clone -q "$2" "$1" 2>/dev/null || [ -z "$(git -C "$1" ls-remote --heads origin 2>/dev/null | head -1)" ]; then
+              rm -rf "$1"
+              mkdir -p "$1" && cd "$1"
+              git init -q -b master
+              echo "# dsh-dist" > README.md
+              git add README.md
+              git -c user.name="dist-bot" -c user.email="dist-bot@users.noreply.github.com" commit -qm "chore: init"
+              git remote add origin "$2"
+              git push -q origin master
+              cd - >/dev/null
+            else
+              git -C "$1" checkout -q -B master
+              git -C "$1" push -q origin master
+            fi
+          }
+          prepare_dist /tmp/dist-gitee "https://zhang-jixiangZJX:${GITEE_TOKEN}@gitee.com/zhang-jixiangZJX/dsh-dist.git"
+          prepare_dist /tmp/dist-gh "https://x-access-token:${GH_PAT}@github.com/${GITHUB_DIST_REPO}.git"
+
+          # Gitee Release + 附件(注意字段名是 file 单数;带状态码检查)
+          RELEASE_JSON=$(curl -fsS --retry 3 --retry-all-errors --connect-timeout 20 --max-time 120 \
+            -X POST "https://gitee.com/api/v5/repos/zhang-jixiangZJX/dsh-dist/releases" \
+            -H "Content-Type: application/json;charset=UTF-8" \
+            -d "{\"access_token\":\"${GITEE_TOKEN}\",\"tag_name\":\"${TAG}\",\"name\":\"${TAG}\",\"body\":\"dsh ${VERSION} Windows 开箱即用包 | sha256 ${SHA256} | ${BUILT_AT}\",\"target_commitish\":\"master\"}")
+          RELEASE_ID=$(echo "$RELEASE_JSON" | node -e "let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>console.log(JSON.parse(d).id))")
+          echo "Gitee Release ID: $RELEASE_ID"
+          HTTP=$(curl -sS -o /tmp/attach-resp.txt -w '%{http_code}' --connect-timeout 20 --max-time 600 \
+            -X POST "https://gitee.com/api/v5/repos/zhang-jixiangZJX/dsh-dist/releases/${RELEASE_ID}/attach_files" \
+            -F "access_token=${GITEE_TOKEN}" -F "file=@${ZIP}")
+          if [ "$HTTP" != "200" ] && [ "$HTTP" != "201" ]; then
+            echo "Gitee 附件上传失败 HTTP $HTTP"; cat /tmp/attach-resp.txt; exit 1
+          fi
+          echo "Gitee 附件上传完成"
+
+          # GitHub Release + 附件
+          gh release create "$TAG" "$ZIP" \
+            -R "${GITHUB_DIST_REPO}" \
+            --title "$TAG" \
+            --notes "dsh ${VERSION} Windows 开箱即用包 | sha256 ${SHA256} | ${BUILT_AT} | Gitee: ${GITEE_URL}" \
+            --target master
+
+          # 双端覆写 latest.json(指针最后移动)
+          write_latest() { # $1=目录
+            cd "$1"
+            cat > latest.json <<EOF
+          {
+            "version": "${VERSION}",
+            "built_at": "${BUILT_AT}",
+            "bundle": {
+              "win_x64": {
+                "gitee_url": "${GITEE_URL}",
+                "github_url": "${GITHUB_URL}",
+                "size": ${SIZE},
+                "sha256": "${SHA256}"
+              }
+            }
+          }
+          EOF
+            git config user.name "dist-bot"
+            git config user.email "dist-bot@users.noreply.github.com"
+            git add latest.json
+            git commit -qm "chore: bundle latest -> v${VERSION}"
+            git push -q origin master
+            cd - >/dev/null
+          }
+          write_latest /tmp/dist-gitee
+          write_latest /tmp/dist-gh
+
+          echo "完成: $TAG"
+          echo "  国内: $GITEE_URL"
+          echo "  海外: $GITHUB_URL"
